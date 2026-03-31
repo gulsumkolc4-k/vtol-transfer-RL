@@ -118,9 +118,17 @@ python vtol_transfer_v2.py
 ---
 
 ## Sonraki Adımlar
+## Sonraki Adımlar
 
-- [ ] Çoklu seed (3-5 farklı seed ile tekrar et, ortalama al)
-- [ ] Domain randomization (kütle, sürtünme, motor gürültüsü)
+### Kısa vade
+- [ ] Kademeli DoF transferi — Yol A (sabit gözlem uzayı)
+- [ ] 3 ortam: Pitch / Pitch+Roll / Pitch+Roll+Yaw
+- [ ] Çoklu seed (3-5 farklı seed, ortalama + std)
+
+### Orta vade
 - [ ] Gazebo SIL entegrasyonu (ROS2 Humble + Gazebo Harmonic)
-- [ ] Uçuş yolu görselleştirme (waypoint izleri)
-- [ ] Transition modu araştırması (airspeed sensörü eklendikten sonra)
+- [ ] Domain randomization
+
+### Uzun vade (zaman kalırsa)
+- [ ] Yol B: Progressive Network (Rusu et al. 2016)
+- [ ] Transition modu (airspeed sensörü sonrası)

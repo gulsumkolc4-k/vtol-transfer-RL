@@ -1,37 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-VTOL Kademeli DoF Transferi — Yol A
-=====================================
+VTOL Kademeli DoF Transferi — Hover Kontrolü
+=============================================
 Hipotez:
-  Düşük DoF'lu modelde ön eğitim yapılmış PPO politikasını
-  yüksek DoF'lu modelde ince ayarlamak, sıfırdan eğitimden
-  daha verimlidir.
+  Düşük DoF'lu modelde hover öğrenen PPO politikasını
+  yüksek DoF'lu modele transfer etmek, sıfırdan
+  eğitimden daha verimlidir.
 
-Model 1 — Pitch only    : x-z düzlemi, roll=0, yaw=0
-Model 2 — Pitch + Roll  : x-y-z, yaw=0
+Görev: Hedef noktada sabit kal (hover).
+  Başarı kriteri: Episode boyunca hedefe ortalama mesafe < 1m
+
+Model 1 — Pitch only    : x-z düzlemi
+Model 2 — Pitch + Roll  : x-y-z
 Model 3 — Pitch+Roll+Yaw: Tam 3D
 
-Yol A: Sabit 14 boyutlu gözlem + 4 boyutlu aksiyon.
-  Kullanılmayan DoF değerleri gözlemde 0 gelir.
-  Kullanılmayan aksiyonlar fizik motorunda maskelenir.
-  PPO ağ boyutu hiç değişmez → transfer direkt çalışır.
+Yol A: 14 boyutlu sabit gözlem, 4 boyutlu sabit aksiyon.
+  Kullanılmayan DoF gözlemde 0, aksiyonda maskelenir.
 
 Gözlem (14 boyut):
-  [x, z, θ, vx, vz, q,   ← pitch (6)
-   y, vy, φ, p,           ← roll  (4, Model 1'de = 0)
-   ψ, r,                  ← yaw   (2, Model 1-2'de = 0)
-   dx, dz]                ← hedefe uzaklık (2)
+  [x, z, θ, vx, vz, q,    ← pitch (6)
+   y, vy, φ, p,            ← roll  (4, Model 1'de = 0)
+   ψ, r,                   ← yaw   (2, Model 1-2'de = 0)
+   dx, dz]                 ← hedefe uzaklık (2)
 
 Aksiyon (4 boyut):
   [thrust, pitch_tork, roll_tork, yaw_tork]
-  Model 1: roll_tork, yaw_tork maskelenir (=0)
-  Model 2: yaw_tork maskelenir (=0)
-  Model 3: hepsi aktif
-
-3 Strateji — eşit toplam bütçe:
-  S1 Zero-shot : Model 1'de N adım → Model 3'te test
-  S2 Transfer  : Model 1'de N adım → Model 3'te K adım
-  S3 Sıfırdan  : Model 3'te N+K adım
 """
 
 import matplotlib
@@ -52,26 +45,26 @@ from stable_baselines3.common.callbacks import BaseCallback
 # 1. ORTAM
 # ══════════════════════════════════════════════════════════════
 
-class VTOLDoFEnv(gym.Env):
-    """
-    dof=1 → Sadece Pitch   (x-z düzlemi)
-    dof=2 → Pitch + Roll   (x-y-z)
-    dof=3 → Pitch+Roll+Yaw (tam 3D)
+TARGET = np.array([0.0, 0.0, 10.0])   # Sabit hedef: (x=0, y=0, z=10)
 
-    Gözlem her zaman 14 boyut — kullanılmayan DoF = 0
-    Aksiyon her zaman 4 boyut — kullanılmayan aksiyon maskelenir
+class VTOLHoverEnv(gym.Env):
+    """
+    Görev: TARGET noktasında sabit hover yap.
+    Başarı: Hedefe mesafe < 1.0m ise o adımda bonus alır.
+
+    dof=1 → Pitch only
+    dof=2 → Pitch + Roll
+    dof=3 → Pitch + Roll + Yaw
     """
 
-    N_WAYPOINTS  = 4
-    REACH_RADIUS = 1.5
-    WP_BONUS     = 20.0
-    MAX_STEPS    = 400
-    OBS_DIM      = 14
-    ACT_DIM      = 4
+    MAX_STEPS = 500
+    OBS_DIM   = 14
+    ACT_DIM   = 4
+    SUCCESS_R  = 1.0    # Hedefe yakın olunca adım başı bonus
 
     def __init__(self, dof=1):
         super().__init__()
-        assert dof in (1, 2, 3), "dof 1, 2 veya 3 olmalı"
+        assert dof in (1, 2, 3)
         self.dof = dof
 
         self.action_space = spaces.Box(
@@ -82,41 +75,16 @@ class VTOLDoFEnv(gym.Env):
             shape=(self.OBS_DIM,), dtype=np.float32
         )
         self.dt = 0.05
-        self.reset()
-
-    # ── Waypoint üret ─────────────────────────────────────────
-    def _sample_waypoints(self):
-        pts = []
-        while len(pts) < self.N_WAYPOINTS:
-            if self.dof == 1:
-                # Sadece x-z düzlemi
-                p = np.array([
-                    np.random.uniform(-12, 12),
-                    0.0,
-                    np.random.uniform(3, 20)
-                ])
-            else:
-                # x-y-z
-                p = np.array([
-                    np.random.uniform(-12, 12),
-                    np.random.uniform(-12, 12),
-                    np.random.uniform(3, 20)
-                ])
-            if all(np.linalg.norm(p - q) > 4.0 for q in pts):
-                pts.append(p)
-        return pts
 
     # ── Gözlem ────────────────────────────────────────────────
     def _obs(self):
         x, z, theta, vx, vz, q = self.pitch_state
-        y,    phi,   p         = self.roll_state    # dof<2 → 0
-        psi,  r                = self.yaw_state     # dof<3 → 0
+        y, phi, p               = self.roll_state
+        psi, r                  = self.yaw_state
 
-        target = self.waypoints[self.wp_idx]
-        dx = target[0] - x
-        dz = target[2] - z
+        dx = TARGET[0] - x
+        dz = TARGET[2] - z
 
-        # 14 boyutlu sabit gözlem
         return np.array([
             x, z, theta, vx, vz, q,   # pitch (6)
             y, 0.0, phi, p,            # roll  (4)
@@ -127,47 +95,41 @@ class VTOLDoFEnv(gym.Env):
     # ── Reset ─────────────────────────────────────────────────
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.waypoints  = self._sample_waypoints()
-        self.wp_idx     = 0
-        self.wp_reached = 0
-        self.steps      = 0
+        self.steps        = 0
+        self.success_steps = 0   # Hedefe yakın geçirilen adım
 
-        # Pitch durumu: [x, z, theta, vx, vz, q]
+        # Hedefe yakın rastgele başlangıç
         self.pitch_state = np.array([
-            np.random.uniform(-10, 10),
-            np.random.uniform(2, 18),
-            np.random.uniform(-0.3, 0.3),
+            np.random.uniform(-5, 5),    # x
+            np.random.uniform(5, 15),    # z
+            np.random.uniform(-0.2, 0.2),# theta
             0.0, 0.0, 0.0
         ], dtype=np.float32)
 
-        # Roll durumu: [y, phi, p]
         self.roll_state = np.zeros(3, dtype=np.float32)
         if self.dof >= 2:
-            self.roll_state[0] = np.random.uniform(-10, 10)
+            self.roll_state[0] = np.random.uniform(-5, 5)  # y
 
-        # Yaw durumu: [psi, r]
         self.yaw_state = np.zeros(2, dtype=np.float32)
 
         return self._obs(), {}
 
     # ── Fizik ─────────────────────────────────────────────────
     def _dynamics(self, action):
-        thrust      = (action[0] + 1) * 10.0   # [0, 20] N
-        pitch_tork  =  action[1] * 1.0
-        roll_tork   =  action[2] * 1.0 if self.dof >= 2 else 0.0
-        yaw_tork    =  action[3] * 1.0 if self.dof >= 3 else 0.0
+        thrust     = (action[0] + 1) * 10.0
+        pitch_tork =  action[1] * 1.0
+        roll_tork  =  action[2] * 1.0 if self.dof >= 2 else 0.0
+        yaw_tork   =  action[3] * 1.0 if self.dof >= 3 else 0.0
 
-        m, g = 1.0, 9.81
-        Jp, Jr, Jy = 0.1, 0.1, 0.15   # Eylemsizlik momentleri
-        rho, S     = 1.225, 0.5
+        m, g           = 1.0, 9.81
+        Jp, Jr, Jy     = 0.1, 0.1, 0.15
+        rho, S, Cd     = 1.225, 0.5, 0.05
 
-        # ── Pitch dinamiği (her modelde aktif) ────────────────
+        # ── Pitch ─────────────────────────────────────────────
         x, z, theta, vx, vz, q = self.pitch_state
-        v_mag_xz = np.sqrt(vx**2 + vz**2) + 1e-6
-        Cd_pitch  = 0.05
-
-        drag_x = 0.5 * rho * vx**2 * S * Cd_pitch * np.sign(vx)
-        drag_z = 0.5 * rho * vz**2 * S * Cd_pitch * np.sign(vz)
+        v_mag = np.sqrt(vx**2 + vz**2) + 1e-6
+        drag_x = 0.5 * rho * vx**2 * S * Cd * np.sign(vx)
+        drag_z = 0.5 * rho * vz**2 * S * Cd * np.sign(vz)
 
         ax = -(thrust/m)*np.sin(theta) - drag_x/m
         az =  (thrust/m)*np.cos(theta) - g - drag_z/m
@@ -180,23 +142,17 @@ class VTOLDoFEnv(gym.Env):
         self.pitch_state[1] += self.pitch_state[4] * self.dt
         self.pitch_state[2] += self.pitch_state[5] * self.dt
 
-        # ── Roll dinamiği (dof >= 2) ──────────────────────────
+        # ── Roll ──────────────────────────────────────────────
         if self.dof >= 2:
             y, phi, p = self.roll_state
-            Cd_roll   = 0.08
-
-            drag_y = 0.5 * rho * (p*0.5)**2 * S * Cd_roll * np.sign(p)
-            ay     = (thrust/m)*np.sin(phi) - drag_y/m
-            ap     = roll_tork / Jr
-
+            ap = roll_tork / Jr
             self.roll_state[2] += ap * self.dt
             self.roll_state[0] += self.roll_state[2] * self.dt * 0.5
             self.roll_state[1] += self.roll_state[2] * self.dt
 
-        # ── Yaw dinamiği (dof >= 3) ───────────────────────────
+        # ── Yaw ───────────────────────────────────────────────
         if self.dof >= 3:
-            psi, r  = self.yaw_state
-            ar      = yaw_tork / Jy
+            ar = yaw_tork / Jy
             self.yaw_state[1] += ar * self.dt
             self.yaw_state[0] += self.yaw_state[1] * self.dt
 
@@ -205,57 +161,67 @@ class VTOLDoFEnv(gym.Env):
         self._dynamics(action)
         self.steps += 1
 
-        x, z = self.pitch_state[0], self.pitch_state[1]
+        x, z  = self.pitch_state[0], self.pitch_state[1]
         theta = self.pitch_state[2]
         y     = self.roll_state[0] if self.dof >= 2 else 0.0
 
-        pos    = np.array([x, y, z])
-        target = self.waypoints[self.wp_idx]
-        dist   = np.linalg.norm(pos - target)
+        pos  = np.array([x, y, z])
+        dist = np.linalg.norm(pos - TARGET)
 
+        # Ödül: mesafe cezası + eğim cezası + hız cezası
         reward = (
             -1.0  * dist
-            - 0.05 * abs(theta)
-            - 0.01 * (self.pitch_state[3]**2 + self.pitch_state[4]**2)
+            - 0.1  * abs(theta)
+            - 0.05 * (self.pitch_state[3]**2 + self.pitch_state[4]**2)
         )
 
-        if dist < self.REACH_RADIUS:
-            reward += self.WP_BONUS
-            self.wp_reached += 1
-            if self.wp_idx < self.N_WAYPOINTS - 1:
-                self.wp_idx += 1
+        # Hedefe yakınsa adım başı bonus
+        if dist < 1.0:
+            reward += self.SUCCESS_R
+            self.success_steps += 1
 
         terminated = bool(
             self.steps >= self.MAX_STEPS
             or z < 0
-            or abs(x) > 50
-            or abs(z) > 60
+            or abs(x) > 40
+            or abs(z) > 50
         )
 
-        return self._obs(), reward, terminated, False,\
-               {"wp_reached": self.wp_reached}
+        info = {
+            "dist"         : dist,
+            "success_steps": self.success_steps,
+            "success_rate" : self.success_steps / self.steps
+        }
+        return self._obs(), reward, terminated, False, info
 
 
 # ══════════════════════════════════════════════════════════════
 # 2. CALLBACK
 # ══════════════════════════════════════════════════════════════
 
-class TrainCallback(BaseCallback):
+class HoverCallback(BaseCallback):
+    """
+    Her eval_freq adımda:
+      - Ortalama ödül
+      - Ortalama hedefe mesafe
+      - Başarı oranı (hedefe yakın adım / toplam adım)
+    """
     def __init__(self, eval_env, eval_freq=10_000,
                  n_eval=200, verbose=0):
         super().__init__(verbose)
         self.eval_env  = eval_env
         self.eval_freq = eval_freq
         self.n_eval    = n_eval
-        self.timesteps = []
-        self.rewards   = []
-        self.wp_rates  = []
+        self.timesteps    = []
+        self.rewards      = []
+        self.mean_dists   = []
+        self.success_rates = []
 
     def _on_step(self) -> bool:
         if self.num_timesteps % self.eval_freq == 0:
-            ep_rewards, wp_totals = [], []
+            ep_rewards, ep_dists, ep_success = [], [], []
             obs, _ = self.eval_env.reset()
-            ep_r, wp_ep, count = 0.0, 0, 0
+            ep_r, ep_d, count = 0.0, [], 0
 
             while count < self.n_eval:
                 action, _ = self.model.predict(
@@ -264,21 +230,21 @@ class TrainCallback(BaseCallback):
                 obs, r, done, trunc, info = \
                     self.eval_env.step(action)
                 ep_r += r
-                if "wp_reached" in info:
-                    wp_ep = info["wp_reached"]
+                ep_d.append(info["dist"])
+
                 if done or trunc:
                     ep_rewards.append(ep_r)
-                    wp_totals.append(wp_ep)
+                    ep_dists.append(np.mean(ep_d))
+                    ep_success.append(info["success_rate"])
                     obs, _ = self.eval_env.reset()
-                    ep_r, wp_ep = 0.0, 0
+                    ep_r, ep_d = 0.0, []
                     count += 1
 
             self.timesteps.append(self.num_timesteps)
             self.rewards.append(np.mean(ep_rewards))
-            self.wp_rates.append(
-                np.mean(wp_totals) /
-                VTOLDoFEnv.N_WAYPOINTS * 100
-            )
+            self.mean_dists.append(np.mean(ep_dists))
+            self.success_rates.append(np.mean(ep_success) * 100)
+
         return True
 
 
@@ -287,9 +253,9 @@ class TrainCallback(BaseCallback):
 # ══════════════════════════════════════════════════════════════
 
 N_ENVS    = 8
-N_DOF1    = 1_000_000   # Model 1 (Pitch) eğitim adımı
-K_DOF3    =   500_000   # Model 3 (Tam 3D) ince ayar adımı
-EVAL_FREQ = 20_000
+N_DOF1    = 500_000    # Model 1 (Pitch) eğitim adımı
+K_DOF3    = 300_000    # Model 3 (Tam 3D) ince ayar adımı
+EVAL_FREQ = 10_000
 N_EVAL    = 200
 
 PPO_KWARGS = dict(
@@ -303,43 +269,42 @@ PPO_KWARGS = dict(
     device        = "cpu",
 )
 
-vec_dof1 = make_vec_env(
-    VTOLDoFEnv, n_envs=N_ENVS, env_kwargs={"dof": 1}
-)
-vec_dof3 = make_vec_env(
-    VTOLDoFEnv, n_envs=N_ENVS, env_kwargs={"dof": 3}
-)
-eval_dof1 = VTOLDoFEnv(dof=1)
-eval_dof3 = VTOLDoFEnv(dof=3)
+vec_dof1  = make_vec_env(VTOLHoverEnv, n_envs=N_ENVS,
+                          env_kwargs={"dof": 1})
+vec_dof3  = make_vec_env(VTOLHoverEnv, n_envs=N_ENVS,
+                          env_kwargs={"dof": 3})
+eval_dof1 = VTOLHoverEnv(dof=1)
+eval_dof3 = VTOLHoverEnv(dof=3)
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. S1 & S2 — Model 1 (Pitch) ön eğitim
+# 4. S1 & S2 — Model 1 ön eğitim
 # ══════════════════════════════════════════════════════════════
 
 print("═" * 55)
-print("ADIM 1 — Ön eğitim: Model 1 (sadece Pitch)")
+print("ADIM 1 — Ön eğitim: Model 1 (Pitch only)")
 print("═" * 55)
 
-cb_dof1 = TrainCallback(eval_dof1, eval_freq=EVAL_FREQ,
-                        n_eval=N_EVAL)
+cb_dof1 = HoverCallback(eval_dof1, eval_freq=EVAL_FREQ,
+                         n_eval=N_EVAL)
 model_dof1 = PPO(env=vec_dof1, **PPO_KWARGS)
 model_dof1.learn(total_timesteps=N_DOF1, callback=cb_dof1)
-model_dof1.save("model_dof1_pitch")
-print("  → Kaydedildi: model_dof1_pitch.zip")
+model_dof1.save("hover_dof1_pitch")
+print("  → Kaydedildi: hover_dof1_pitch.zip")
 
 
 # ── S1: Zero-shot ────────────────────────────────────────────
 print("\nADIM 2 — S1 Zero-shot: Model 3'te direkt test")
 
-cb_zs = TrainCallback(eval_dof3, eval_freq=1, n_eval=N_EVAL)
+cb_zs = HoverCallback(eval_dof3, eval_freq=1, n_eval=N_EVAL)
 cb_zs.init_callback(model_dof1)
 cb_zs.num_timesteps = 0
 cb_zs._on_step()
 
-r_zs  = cb_zs.rewards[0]
-wp_zs = cb_zs.wp_rates[0]
-print(f"  Ödül: {r_zs:.2f}  |  WP başarı: %{wp_zs:.1f}")
+r_zs   = cb_zs.rewards[0]
+d_zs   = cb_zs.mean_dists[0]
+sr_zs  = cb_zs.success_rates[0]
+print(f"  Ödül: {r_zs:.2f} | Mesafe: {d_zs:.2f}m | Başarı: %{sr_zs:.1f}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -348,23 +313,23 @@ print(f"  Ödül: {r_zs:.2f}  |  WP başarı: %{wp_zs:.1f}")
 
 print("\nADIM 3 — S2 Transfer: Model 3'te ince ayar")
 
-model_ft = PPO.load(
-    "model_dof1_pitch", env=vec_dof3, device="cpu"
-)
+model_ft = PPO.load("hover_dof1_pitch", env=vec_dof3,
+                     device="cpu")
 model_ft.learning_rate = 1e-4
 
-cb_ft = TrainCallback(eval_dof3, eval_freq=EVAL_FREQ,
-                      n_eval=N_EVAL)
+cb_ft = HoverCallback(eval_dof3, eval_freq=EVAL_FREQ,
+                       n_eval=N_EVAL)
 model_ft.learn(
     total_timesteps=K_DOF3,
     callback=cb_ft,
     reset_num_timesteps=False
 )
-model_ft.save("model_dof3_finetuned")
+model_ft.save("hover_dof3_finetuned")
 
-r_ft  = cb_ft.rewards[-1]
-wp_ft = cb_ft.wp_rates[-1]
-print(f"  Ödül: {r_ft:.2f}  |  WP başarı: %{wp_ft:.1f}")
+r_ft   = cb_ft.rewards[-1]
+d_ft   = cb_ft.mean_dists[-1]
+sr_ft  = cb_ft.success_rates[-1]
+print(f"  Ödül: {r_ft:.2f} | Mesafe: {d_ft:.2f}m | Başarı: %{sr_ft:.1f}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -373,18 +338,19 @@ print(f"  Ödül: {r_ft:.2f}  |  WP başarı: %{wp_ft:.1f}")
 
 print("\nADIM 4 — S3 Sıfırdan: Model 3'te eğitim")
 
-cb_sc = TrainCallback(eval_dof3, eval_freq=EVAL_FREQ,
-                      n_eval=N_EVAL)
+cb_sc = HoverCallback(eval_dof3, eval_freq=EVAL_FREQ,
+                       n_eval=N_EVAL)
 model_sc = PPO(env=vec_dof3, **PPO_KWARGS)
 model_sc.learn(
     total_timesteps=N_DOF1 + K_DOF3,
     callback=cb_sc
 )
-model_sc.save("model_dof3_scratch")
+model_sc.save("hover_dof3_scratch")
 
-r_sc  = cb_sc.rewards[-1]
-wp_sc = cb_sc.wp_rates[-1]
-print(f"  Ödül: {r_sc:.2f}  |  WP başarı: %{wp_sc:.1f}")
+r_sc   = cb_sc.rewards[-1]
+d_sc   = cb_sc.mean_dists[-1]
+sr_sc  = cb_sc.success_rates[-1]
+print(f"  Ödül: {r_sc:.2f} | Mesafe: {d_sc:.2f}m | Başarı: %{sr_sc:.1f}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -392,123 +358,132 @@ print(f"  Ödül: {r_sc:.2f}  |  WP başarı: %{wp_sc:.1f}")
 # ══════════════════════════════════════════════════════════════
 
 SAVE_DIR    = os.path.dirname(os.path.abspath(__file__))
-RESULT_PATH = os.path.join(SAVE_DIR, "vtol_dof_transfer_results.png")
+RESULT_PATH = os.path.join(SAVE_DIR, "vtol_hover_dof_results.png")
 COLORS      = {"zs": "#ff9999", "ft": "#66b3ff", "sc": "#99ff99"}
+
+# S2 eğrisi için doğru x ekseni:
+# cb_ft.timesteps değerleri reset_num_timesteps=False ile
+# N_DOF1'den devam ediyor — olduğu gibi kullan
+ft_ts = cb_ft.timesteps
 
 fig = plt.figure(figsize=(16, 9))
 fig.suptitle(
-    "VTOL Kademeli DoF Transferi — Pitch → Pitch+Roll+Yaw\n"
-    "Hipotez: Düşük DoF ön eğitim + ince ayar, sıfırdan eğitimden üstündür",
+    "VTOL Hover Kontrolü — Kademeli DoF Transferi\n"
+    "Model 1 (Pitch) → Model 3 (Pitch+Roll+Yaw)",
     fontsize=13, fontweight="bold"
 )
 gs = gridspec.GridSpec(2, 3, figure=fig,
-                       hspace=0.42, wspace=0.35)
+                        hspace=0.42, wspace=0.35)
+
+lbls = ["S1\nZero-shot", "S2\nTransfer", "S3\nSıfırdan"]
+cols = [COLORS["zs"], COLORS["ft"], COLORS["sc"]]
 
 # ── Sol üst: Final ödül ──────────────────────────────────────
 ax1 = fig.add_subplot(gs[0, 0])
-lbls    = ["S1\nZero-shot", "S2\nTransfer", "S3\nSıfırdan"]
-rewards = [r_zs, r_ft, r_sc]
-cols    = [COLORS["zs"], COLORS["ft"], COLORS["sc"]]
-bars = ax1.bar(lbls, rewards, color=cols,
+bars = ax1.bar(lbls, [r_zs, r_ft, r_sc], color=cols,
                edgecolor="gray", linewidth=0.6, width=0.5)
 ax1.axhline(0, color="black", linewidth=0.7,
             linestyle="--", alpha=0.4)
 ax1.set_title("Final ortalama ödül", fontsize=11)
 ax1.set_ylabel("Ortalama ödül")
 ax1.grid(axis="y", linestyle="--", alpha=0.4)
+ax1.autoscale(axis="y")
 for b in bars:
     h = b.get_height()
     ax1.text(b.get_x() + b.get_width()/2,
-             h + (1 if h >= 0 else -5),
-             f"{h:.1f}", ha="center", va="bottom",
+             h + (1 if h >= 0 else -5), f"{h:.1f}",
+             ha="center", va="bottom",
              fontsize=10, fontweight="bold")
 
-# ── Orta üst: Waypoint başarı ────────────────────────────────
+# ── Orta üst: Ortalama mesafe (ters eksen — düşük = iyi) ─────
 ax2 = fig.add_subplot(gs[0, 1])
-wp_vals = [wp_zs, wp_ft, wp_sc]
-bars2 = ax2.bar(lbls, wp_vals, color=cols,
+bars2 = ax2.bar(lbls, [d_zs, d_ft, d_sc], color=cols,
                 edgecolor="gray", linewidth=0.6, width=0.5)
-ax2.set_ylim(0, 110)
-ax2.set_title("Waypoint başarı oranı (%)", fontsize=11)
-ax2.set_ylabel("Tamamlanan WP oranı")
-ax2.axhline(100, color="green", linewidth=0.8,
-            linestyle=":", alpha=0.5, label="Mükemmel")
-ax2.grid(axis="y", linestyle="--", alpha=0.4)
+ax2.axhline(1.0, color="green", linewidth=1.0,
+            linestyle=":", label="Hedef < 1m")
+ax2.set_title("Ortalama hedefe mesafe (m)\ndüşük = iyi", fontsize=11)
+ax2.set_ylabel("Mesafe (m)")
 ax2.legend(fontsize=8)
+ax2.grid(axis="y", linestyle="--", alpha=0.4)
+# Otomatik ölçek — veriye göre ayarla
+max_d = max(d_zs, d_ft, d_sc) * 1.2
+ax2.set_ylim(0, max_d)
 for b in bars2:
     h = b.get_height()
-    ax2.text(b.get_x() + b.get_width()/2, h + 1,
+    ax2.text(b.get_x() + b.get_width()/2, h + max_d * 0.02,
+             f"{h:.2f}m", ha="center", va="bottom",
+             fontsize=10, fontweight="bold")
+
+# ── Sağ üst: Başarı oranı (otomatik ölçek) ───────────────────
+ax3 = fig.add_subplot(gs[0, 2])
+bars3 = ax3.bar(lbls, [sr_zs, sr_ft, sr_sc], color=cols,
+                edgecolor="gray", linewidth=0.6, width=0.5)
+max_sr = max(sr_zs, sr_ft, sr_sc, 1.0) * 1.3
+ax3.set_ylim(0, min(max_sr, 110))
+ax3.axhline(100, color="green", linewidth=0.8,
+            linestyle=":", alpha=0.5, label="Mükemmel")
+ax3.set_title("Başarı oranı (%)\n(hedefe yakın adım / toplam)", fontsize=11)
+ax3.set_ylabel("Başarı oranı (%)")
+ax3.legend(fontsize=8)
+ax3.grid(axis="y", linestyle="--", alpha=0.4)
+for b in bars3:
+    h = b.get_height()
+    ax3.text(b.get_x() + b.get_width()/2,
+             h + max_sr * 0.02,
              f"%{h:.1f}", ha="center", va="bottom",
              fontsize=10, fontweight="bold")
 
-# ── Sağ üst: Özet ────────────────────────────────────────────
-ax3 = fig.add_subplot(gs[0, 2])
-ax3.axis("off")
-gain_r  = r_ft  - r_sc
-gain_wp = wp_ft - wp_sc
-rows = [
-    ("Strateji",       "Ödül",           "WP %"),
-    ("S1 Zero-shot",   f"{r_zs:.1f}",    f"%{wp_zs:.1f}"),
-    ("S2 Transfer ★", f"{r_ft:.1f}",    f"%{wp_ft:.1f}"),
-    ("S3 Sıfırdan",    f"{r_sc:.1f}",    f"%{wp_sc:.1f}"),
-    ("", "", ""),
-    ("S2 − S3",        f"{gain_r:+.1f}", f"{gain_wp:+.1f}pp"),
-    ("Hipotez",
-     "✓ Desteklendi" if gain_r > 0 else "✗ Desteklenmedi",
-     ""),
-]
-ax3.set_title("Özet", fontsize=11)
-y = 0.95
-for i, row in enumerate(rows):
-    w = "bold" if i in (0, 5, 6) else "normal"
-    c = "#1a5c8c" if i == 2 else "black"
-    ax3.text(0.0,  y, row[0], transform=ax3.transAxes,
-             fontsize=9, fontweight=w, color=c)
-    ax3.text(0.55, y, row[1], transform=ax3.transAxes,
-             fontsize=9, fontweight=w, color=c)
-    ax3.text(0.80, y, row[2], transform=ax3.transAxes,
-             fontsize=9, fontweight=w, color=c)
-    y -= 0.13
-    if i == 0:
-        ax3.plot([0, 1], [y + 0.06, y + 0.06],
-                 color="gray", linewidth=0.6,
-                 transform=ax3.transAxes)
-
-# ── Alt sol+orta: Öğrenme eğrisi ─────────────────────────────
+# ── Alt sol+orta: Öğrenme eğrisi — ödül ─────────────────────
 ax4 = fig.add_subplot(gs[1, 0:2])
+
+# S3: 0'dan N_DOF1+K_DOF3 adıma kadar
 ax4.plot(cb_sc.timesteps, cb_sc.rewards,
          color=COLORS["sc"], linewidth=2,
-         label="S3 Sıfırdan (Model 3)")
-ax4.plot(cb_ft.timesteps, cb_ft.rewards,
+         label="S3 Sıfırdan")
+
+# S2: sadece ince ayar kısmı (N_DOF1'den itibaren)
+ax4.plot(ft_ts, cb_ft.rewards,
          color=COLORS["ft"], linewidth=2.5,
          label="S2 Transfer (ince ayar)")
+
+# Zero-shot yatay çizgi
 ax4.axhline(r_zs, color=COLORS["zs"], linestyle="--",
             linewidth=1.5,
             label=f"S1 Zero-shot ({r_zs:.1f})")
+
+# İnce ayar başlangıç noktası
 ax4.axvline(N_DOF1, color="gray", linestyle=":",
-            linewidth=1.2, label="İnce ayar başladı")
-ax4.set_xlabel("Model 3'teki adım sayısı")
+            linewidth=1.2, label=f"İnce ayar başladı ({N_DOF1:,})")
+
+ax4.set_xlabel("Toplam adım sayısı")
 ax4.set_ylabel("Ortalama ödül")
-ax4.set_title("Öğrenme eğrisi — Model 3 (Pitch+Roll+Yaw)",
+ax4.set_title("Öğrenme eğrisi — Model 3 (Pitch+Roll+Yaw)\n"
+              "S2 yalnızca ince ayar aşamasında gösteriliyor",
               fontsize=11)
 ax4.legend(fontsize=9)
 ax4.grid(linestyle="--", alpha=0.4)
+ax4.autoscale(axis="y")
 
-# ── Alt sağ: WP başarı eğrisi ────────────────────────────────
+# ── Alt sağ: Başarı oranı eğrisi (otomatik ölçek) ────────────
 ax5 = fig.add_subplot(gs[1, 2])
-ax5.plot(cb_sc.timesteps, cb_sc.wp_rates,
+ax5.plot(cb_sc.timesteps, cb_sc.success_rates,
          color=COLORS["sc"], linewidth=2,
          label="S3 Sıfırdan")
-ax5.plot(cb_ft.timesteps, cb_ft.wp_rates,
+ax5.plot(ft_ts, cb_ft.success_rates,
          color=COLORS["ft"], linewidth=2.5,
          label="S2 Transfer")
-ax5.axhline(wp_zs, color=COLORS["zs"], linestyle="--",
+ax5.axhline(sr_zs, color=COLORS["zs"], linestyle="--",
             linewidth=1.5,
-            label=f"S1 Zero-shot (%{wp_zs:.1f})")
-ax5.set_ylim(0, 110)
-ax5.set_xlabel("Model 3'teki adım")
-ax5.set_ylabel("WP başarı oranı (%)")
-ax5.set_title("Waypoint başarı eğrisi", fontsize=11)
+            label=f"S1 Zero-shot (%{sr_zs:.1f})")
+
+# Otomatik ölçek — değerlere göre
+all_sr = cb_sc.success_rates + cb_ft.success_rates + [sr_zs]
+max_sr_curve = max(all_sr) if max(all_sr) > 0 else 1.0
+ax5.set_ylim(0, min(max_sr_curve * 1.3, 110))
+
+ax5.set_xlabel("Toplam adım sayısı")
+ax5.set_ylabel("Başarı oranı (%)")
+ax5.set_title("Başarı oranı eğrisi", fontsize=11)
 ax5.legend(fontsize=8)
 ax5.grid(linestyle="--", alpha=0.4)
 
@@ -521,21 +496,26 @@ print(f"\n  → Grafik kaydedildi: {RESULT_PATH}")
 # 8. SONUÇ RAPORU
 # ══════════════════════════════════════════════════════════════
 
-print("\n" + "═" * 55)
+gain_r  = r_ft  - r_sc
+gain_d  = d_sc  - d_ft   # Mesafe farkı: sc > ft iyi
+gain_sr = sr_ft - sr_sc
+
+print("\n" + "═" * 60)
 print("SONUÇ RAPORU")
-print("═" * 55)
-print(f"{'Strateji':<22} {'Ödül':>8} {'WP Başarı':>10}")
-print("-" * 42)
-print(f"{'S1 Zero-shot':<22} {r_zs:>8.2f} {wp_zs:>9.1f}%")
-print(f"{'S2 Transfer ★':<22} {r_ft:>8.2f} {wp_ft:>9.1f}%")
-print(f"{'S3 Sıfırdan':<22} {r_sc:>8.2f} {wp_sc:>9.1f}%")
-print("-" * 42)
+print("═" * 60)
+print(f"{'Strateji':<22} {'Ödül':>8} {'Mesafe':>8} {'Başarı':>8}")
+print("-" * 50)
+print(f"{'S1 Zero-shot':<22} {r_zs:>8.2f} {d_zs:>7.2f}m {sr_zs:>7.1f}%")
+print(f"{'S2 Transfer ★':<22} {r_ft:>8.2f} {d_ft:>7.2f}m {sr_ft:>7.1f}%")
+print(f"{'S3 Sıfırdan':<22} {r_sc:>8.2f} {d_sc:>7.2f}m {sr_sc:>7.1f}%")
+print("-" * 50)
 print(f"\nTransfer avantajı (S2 − S3):")
-print(f"  Ödül     : {gain_r:+.2f}")
-print(f"  WP başarı: {gain_wp:+.1f} pp")
+print(f"  Ödül         : {gain_r:+.2f}")
+print(f"  Mesafe farkı : {gain_d:+.2f}m  (+ = S2 daha yakın)")
+print(f"  Başarı farkı : {gain_sr:+.1f} pp")
 if gain_r > 0:
     pct = abs(gain_r / (abs(r_sc) + 1e-9)) * 100
     print(f"\n  ✓ Hipotez DESTEKLENDI — %{pct:.1f} avantaj")
 else:
     print("\n  ✗ Hipotez desteklenmedi")
-print("═" * 55)
+print("═" * 60)
